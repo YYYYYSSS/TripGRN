@@ -1,0 +1,28 @@
+# project_GRN Python dependencies (step01 + TripGRN + DeepFGRN + baselines)
+#
+# Install order (Windows, conda env project_GRN, Python 3.11):
+#
+#   1) PyTorch GPU (TripGRN / scMGATGRN / GENELink / DeepTGI):
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+#   2) TensorFlow CPU (DeepFGRN on Windows — do NOT use tensorflow[and-cuda] or tensorflow==2.13):
+#      pip install "tensorflow>=2.16,<2.21"
+#
+#   3) Remaining packages:
+#      pip install -r requirements.txt
+#
+# Do NOT `pip install tensorflow` without version pin — may pull tensorflow-intel 2.13 and downgrade numpy.
+
+numpy
+pandas
+scipy
+scikit-learn
+tqdm
+matplotlib
+networkx
+tensorboard
+openpyxl
+scanpy
+anndata
+igraph
+leidenalg
