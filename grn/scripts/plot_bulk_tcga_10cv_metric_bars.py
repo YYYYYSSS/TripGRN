@@ -390,10 +390,12 @@ def main() -> None:
     args = ap.parse_args()
 
     layout = bulk_layout()
-    grn_root = layout["grn_root"]
-    exp_base = grn_root / "experiments" / args.experiment_name
+    # Prefer fig03 experiment tree; allow --experiment-name override of leaf only.
+    exp_base = layout["experiment_base"]
+    if args.experiment_name and args.experiment_name != DEFAULT_BULK_EXPERIMENT:
+        exp_base = layout["fig03"] / "experiments" / args.experiment_name
     summary_csv = exp_base / "summary" / "bulk_10cv_cancer_mean_std.csv"
-    out_dir = Path(args.out_dir) if args.out_dir else (exp_base / "figure")
+    out_dir = Path(args.out_dir) if args.out_dir else (exp_base / "figures" / "main")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not summary_csv.is_file():

@@ -18,10 +18,10 @@ FIG_META = [
     ("fig04_cross_dataset_gse189357", "Fig.4", "Transfer GSE253718 to GSE189357"),
     ("fig05_brain_met_case", "Fig.5", "GSE131907 brain-met application"),
 ]
+# Formal cohorts only; GSE145825 (VCaP cell line) excluded from Fig.1.
 PANCANCER_GSE = [
     "GSE103322",
     "GSE132465",
-    "GSE145825",
     "GSE148071",
     "GSE156632",
     "GSE159115",
@@ -30,6 +30,7 @@ PANCANCER_GSE = [
     "GSE253718",
     "GSE288479",
 ]
+EXCLUDED_GSE = ["GSE145825"]
 TCGA = [
     "TCGA-BRCA",
     "TCGA-COAD",

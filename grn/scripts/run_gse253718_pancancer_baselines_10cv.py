@@ -22,19 +22,19 @@ METHODS = (
     (
         "DeepTGI",
         "grn.scripts.run_deeptgi_pancancer_10cv",
-        ["--batch-size-cap", "512", "--max-genes", "1500"],
+        ["--batch-size-cap", "512", "--max-genes", "0"],
         "grn.scripts.summarize_deeptgi_pancancer_10cv",
     ),
     (
         "scMGATGRN",
         "grn.scripts.run_scmgatgrn_pancancer_10cv",
-        ["--batch-size-cap", "256", "--max-genes", "1500"],
+        ["--batch-size-cap", "256", "--max-genes", "0"],
         "grn.scripts.summarize_scmgatgrn_pancancer_10cv",
     ),
     (
         "GENELink",
         "grn.scripts.run_genelink_pancancer_10cv",
-        ["--batch-size-cap", "256", "--max-genes", "1500"],
+        ["--batch-size-cap", "256", "--max-genes", "0"],
         "grn.scripts.summarize_genelink_pancancer_10cv",
     ),
 )

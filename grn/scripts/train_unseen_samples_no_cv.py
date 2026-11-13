@@ -36,6 +36,7 @@ from grn.evaluation.training_plots import (
 from grn.models.fusion_model import FusionModel, FusionModelAblation
 from grn.reproducibility import set_seed
 from grn.training.pair_dataloader import PairSubsetColumnDataset, build_pair_dataloader
+from grn.utils.runtime import now_mono, write_runtime_json
 
 
 def _autocast_bf16(device: torch.device, enabled: bool):
@@ -53,25 +54,105 @@ def split3(n: int, w1: int, w2: int, w3: int) -> Tuple[int, int, int]:
 
 
 def _build_pair_samples(grn_matrix: torch.Tensor, neg_ratio: float, seed: int):
+    """Positives from GRN; negatives matched to the positive gene universe.
+
+    Negative source ∈ positive sources; target ∈ genes appearing in any positive
+    edge (avoids easy genome-wide non-TF→gene negatives).
+    """
     rng = np.random.RandomState(seed)
     pos = torch.where(grn_matrix > 0)
     pos_pairs = [(int(i.item()), int(j.item()), int(grn_matrix[i, j].item())) for i, j in zip(pos[0], pos[1])]
 
     n_pos = len(pos_pairs)
     n_neg = int(n_pos * neg_ratio)
-    num_genes = grn_matrix.shape[0]
     existing = set((i, j) for i, j, _ in pos_pairs)
+    sources = sorted({i for i, _, _ in pos_pairs})
+    genes = sorted({i for i, _, _ in pos_pairs} | {j for _, j, _ in pos_pairs})
+    if len(sources) < 1 or len(genes) < 2:
+        raise ValueError(
+            f"cannot sample matched negatives from positives: "
+            f"n_sources={len(sources)} n_genes={len(genes)} n_pos={n_pos}"
+        )
     neg_pairs = []
-    while len(neg_pairs) < n_neg:
-        i = int(rng.randint(0, num_genes))
-        j = int(rng.randint(0, num_genes))
-        if (i, j) in existing:
+    max_attempts = max(1_000_000, n_neg * 50)
+    attempts = 0
+    while len(neg_pairs) < n_neg and attempts < max_attempts:
+        attempts += 1
+        i = int(sources[int(rng.randint(0, len(sources)))])
+        j = int(genes[int(rng.randint(0, len(genes)))])
+        if i == j or (i, j) in existing:
+            continue
+        if int(grn_matrix[i, j].item()) != 0:
+            continue
+        neg_pairs.append((i, j, 0))
+        existing.add((i, j))
+    if len(neg_pairs) < n_neg:
+        raise ValueError(
+            f"matched negative sampling incomplete: got {len(neg_pairs)}/{n_neg} "
+            f"(sources={len(sources)}, genes={len(genes)})"
+        )
+    print(
+        f"[unseen-samples] negatives from positive universe: "
+        f"sources={len(sources)} genes={len(genes)} n_neg={len(neg_pairs)}"
+    )
+    return pos_pairs + neg_pairs
+
+
+def _build_pair_samples_within_genes(
+    grn_matrix: torch.Tensor,
+    allowed_genes: Sequence[int],
+    neg_ratio: float,
+    seed: int,
+):
+    """Build pos/neg pairs where both endpoints lie in ``allowed_genes`` (gene-disjoint).
+
+    Negatives are further matched: source ∈ positive sources ∩ allowed;
+    target ∈ positive genes ∩ allowed.
+    """
+    rng = np.random.RandomState(seed)
+    allowed = list(int(g) for g in allowed_genes)
+    allowed_set = set(allowed)
+    if len(allowed) < 2:
+        return []
+
+    pos = torch.where(grn_matrix > 0)
+    pos_pairs = [
+        (int(i.item()), int(j.item()), int(grn_matrix[i, j].item()))
+        for i, j in zip(pos[0], pos[1])
+        if int(i.item()) in allowed_set and int(j.item()) in allowed_set
+    ]
+
+    n_pos = len(pos_pairs)
+    n_neg = int(n_pos * neg_ratio)
+    existing = set((i, j) for i, j, _ in pos_pairs)
+    sources = sorted({i for i, _, _ in pos_pairs})
+    genes = sorted({i for i, _, _ in pos_pairs} | {j for _, j, _ in pos_pairs})
+    if len(sources) < 1 or len(genes) < 2:
+        return pos_pairs
+    neg_pairs = []
+    max_attempts = max(1_000_000, n_neg * 50)
+    attempts = 0
+    while len(neg_pairs) < n_neg and attempts < max_attempts:
+        attempts += 1
+        i = int(sources[int(rng.randint(0, len(sources)))])
+        j = int(genes[int(rng.randint(0, len(genes)))])
+        if i == j or (i, j) in existing:
             continue
         if int(grn_matrix[i, j].item()) != 0:
             continue
         neg_pairs.append((i, j, 0))
         existing.add((i, j))
     return pos_pairs + neg_pairs
+
+
+def _split_gene_indices(n_gene: int, gene_split: str, seed: int) -> Tuple[List[int], List[int], List[int]]:
+    w1, w2, w3 = [int(x.strip()) for x in gene_split.split(",")]
+    a, b, c = split3(n_gene, w1, w2, w3)
+    perm = np.random.RandomState(seed).permutation(n_gene)
+    g_tr = perm[:a].tolist()
+    g_va = perm[a : a + b].tolist()
+    g_te = perm[a + b :].tolist()
+    return g_tr, g_va, g_te
 
 
 def _prepare_batch(batch, device, *, non_blocking: bool = False):
@@ -205,6 +286,43 @@ def main():
     parser.add_argument("--neg-sample-ratio", type=float, default=1.0)
     parser.add_argument("--sample-split", default="5,2,3", help="train,val,test column split ratio")
     parser.add_argument(
+        "--gene-disjoint",
+        dest="gene_disjoint",
+        action="store_true",
+        help="Gene-disjoint protocol: train/val/test gene sets are disjoint so genes are "
+        "invisible across pair splits (cuts CDS/PPI leakage). Default off (legacy).",
+    )
+    parser.add_argument(
+        "--no-gene-disjoint",
+        dest="gene_disjoint",
+        action="store_false",
+        help="Disable gene-disjoint; use legacy random pair split (genes may overlap splits).",
+    )
+    parser.set_defaults(gene_disjoint=False)
+    parser.add_argument(
+        "--gene-split",
+        default="6,2,2",
+        help="train,val,test gene-index split ratio when --gene-disjoint (default 6,2,2).",
+    )
+    parser.add_argument(
+        "--expression-encoder",
+        choices=("vae", "conv"),
+        default="conv",
+        help="Expression front-end: 'conv' (ResNet/CNN, default) or 'vae' (optional pilot).",
+    )
+    parser.add_argument(
+        "--vae-beta",
+        type=float,
+        default=1e-3,
+        help="Weight for expression VAE KL term added to CE loss (ignored when --expression-encoder conv).",
+    )
+    parser.add_argument(
+        "--vae-recon-weight",
+        type=float,
+        default=1e-2,
+        help="Weight for expression VAE reconstruction term (ignored when --expression-encoder conv).",
+    )
+    parser.add_argument(
         "--cv-splits-json",
         default=None,
         help="10-fold CV manifest (from generate_pancancer_cv_splits). Requires --fold-idx.",
@@ -300,6 +418,7 @@ def main():
     use_expr = not args.no_expression
     use_cds_modal = not args.no_cds
     use_ppi = not args.no_ppi
+    gene_disjoint = bool(args.gene_disjoint)
     if not (use_expr or use_cds_modal or use_ppi):
         raise ValueError("At least one modality must be enabled (expression, CDS, or PPI).")
     if use_ppi and not args.ppi_csv:
@@ -320,6 +439,21 @@ def main():
         print("[unseen-samples] Ablation: zero sequence inputs (FusionModel unchanged).")
     if args.no_expression:
         print("[unseen-samples] Ablation: zero expression inputs (FusionModel unchanged).")
+    if gene_disjoint:
+        print(
+            f"[unseen-samples] gene-disjoint ON (gene-split={args.gene_split}): "
+            "genes invisible across train/val/test pairs; PPI uses inductive masks."
+        )
+    else:
+        print("[unseen-samples] gene-disjoint OFF: legacy random pair split (genes may overlap).")
+    expr_enc = str(args.expression_encoder).strip().lower()
+    if expr_enc == "conv":
+        print("[unseen-samples] expression encoder=conv (legacy CNN; no VAE aux loss)")
+    else:
+        print(
+            f"[unseen-samples] expression encoder=VAE (beta={args.vae_beta}, "
+            f"recon_w={args.vae_recon_weight})"
+        )
     if args.no_timestamp:
         run_dir = os.path.join(args.output_base_dir, args.experiment_name)
     else:
@@ -330,6 +464,7 @@ def main():
         run_dir = os.path.join(run_dir, f"fold_{int(args.fold_idx):02d}")
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+    wall_t0 = now_mono()
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, ensure_ascii=False, indent=2)
 
@@ -456,25 +591,71 @@ def main():
     known_grn = (grn_df[tf_col].values, grn_df[tg_col].values, rel.values)
     grn_matrix = get_GRN(known_grn, gene_list)
 
-    # pairs split (still pair split), columns split (unseen samples)
-    all_pairs = _build_pair_samples(grn_matrix, args.neg_sample_ratio, args.seed)
-    if len(all_pairs) == 0:
-        raise ValueError(
-            "GRN 在表达基因交集上未得到任何正样本边（TF–Target 对为空）。"
-            "常见原因：表达矩阵基因列含引号或与 GRN 符号体系不一致；"
-            "已自动 strip 引号，若仍为空请检查基因 ID（如 Ensembl vs symbol）。"
-            "若为 ENSG… Ensembl ID：请运行 python -m grn.scripts.remap_wide_npy_ensembl_to_symbol "
-            "将 npy 转为 symbol 后再训练。"
+    # Pair protocol: gene-disjoint (default) or legacy random pair split
+    g_tr: Optional[List[int]] = None
+    g_va: Optional[List[int]] = None
+    g_te: Optional[List[int]] = None
+    if gene_disjoint:
+        g_tr, g_va, g_te = _split_gene_indices(len(gene_list), args.gene_split, args.seed)
+        pairs_train = _build_pair_samples_within_genes(
+            grn_matrix, g_tr, args.neg_sample_ratio, args.seed
         )
-    labels = np.array([lab for _, _, lab in all_pairs], dtype=np.int64)
-    idx = np.arange(len(all_pairs))
-    tr_idx, te_idx = train_test_split(idx, test_size=0.2, random_state=args.seed, stratify=labels)
-    y_tr = labels[tr_idx]
-    tr_idx2, va_idx = train_test_split(tr_idx, test_size=0.2, random_state=args.seed, stratify=y_tr)
+        pairs_val = _build_pair_samples_within_genes(
+            grn_matrix, g_va, args.neg_sample_ratio, args.seed + 1
+        )
+        pairs_test = _build_pair_samples_within_genes(
+            grn_matrix, g_te, args.neg_sample_ratio, args.seed + 2
+        )
+        print(
+            f"[unseen-samples] gene-disjoint genes train/val/test = "
+            f"{len(g_tr)}/{len(g_va)}/{len(g_te)}; "
+            f"pairs = {len(pairs_train)}/{len(pairs_val)}/{len(pairs_test)}"
+        )
+        with open(os.path.join(run_dir, "gene_disjoint_split.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "gene_split": args.gene_split,
+                    "seed": int(args.seed),
+                    "n_genes": int(len(gene_list)),
+                    "train_gene_idx": g_tr,
+                    "val_gene_idx": g_va,
+                    "test_gene_idx": g_te,
+                    "train_gene_symbols": [gene_list[i] for i in g_tr],
+                    "val_gene_symbols": [gene_list[i] for i in g_va],
+                    "test_gene_symbols": [gene_list[i] for i in g_te],
+                    "n_pairs_train": len(pairs_train),
+                    "n_pairs_val": len(pairs_val),
+                    "n_pairs_test": len(pairs_test),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        if len(pairs_train) == 0 or len(pairs_val) == 0 or len(pairs_test) == 0:
+            raise ValueError(
+                "gene-disjoint 下某 split 的 pair 为空："
+                f"train={len(pairs_train)}, val={len(pairs_val)}, test={len(pairs_test)}。"
+                "可调整 --gene-split 或检查 GRN 边密度。"
+            )
+    else:
+        all_pairs = _build_pair_samples(grn_matrix, args.neg_sample_ratio, args.seed)
+        if len(all_pairs) == 0:
+            raise ValueError(
+                "GRN 在表达基因交集上未得到任何正样本边（TF–Target 对为空）。"
+                "常见原因：表达矩阵基因列含引号或与 GRN 符号体系不一致；"
+                "已自动 strip 引号，若仍为空请检查基因 ID（如 Ensembl vs symbol）。"
+                "若为 ENSG… Ensembl ID：请运行 python -m grn.scripts.remap_wide_npy_ensembl_to_symbol "
+                "将 npy 转为 symbol 后再训练。"
+            )
+        labels = np.array([lab for _, _, lab in all_pairs], dtype=np.int64)
+        idx = np.arange(len(all_pairs))
+        tr_idx, te_idx = train_test_split(idx, test_size=0.2, random_state=args.seed, stratify=labels)
+        y_tr = labels[tr_idx]
+        tr_idx2, va_idx = train_test_split(tr_idx, test_size=0.2, random_state=args.seed, stratify=y_tr)
 
-    pairs_train = [all_pairs[i] for i in tr_idx2]
-    pairs_val = [all_pairs[i] for i in va_idx]
-    pairs_test = [all_pairs[i] for i in te_idx]
+        pairs_train = [all_pairs[i] for i in tr_idx2]
+        pairs_val = [all_pairs[i] for i in va_idx]
+        pairs_test = [all_pairs[i] for i in te_idx]
 
     if args.cv_splits_json:
         from grn.data.pancancer_cv import get_fold_split, load_cv_splits
@@ -607,15 +788,37 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     ppi_node_features = None
+    ppi_feat_train = None
+    ppi_feat_val = None
+    ppi_feat_test = None
     if use_ppi and ppi_extractor is not None:
-        ppi_node_features = ppi_extractor.extract_node_features().detach().cpu()
+        if gene_disjoint and g_tr is not None and g_va is not None and g_te is not None:
+            # Inductive PPI: train subgraph only; val/test see train→eval edges only.
+            ppi_extractor.set_train_mask(g_tr)
+            ppi_feat_train = ppi_extractor.extract_node_features().detach().cpu()
+            ppi_feat_val = ppi_extractor.extract_inductive_inference(g_tr, g_va).detach().cpu()
+            ppi_feat_test = ppi_extractor.extract_inductive_inference(g_tr, g_te).detach().cpu()
+            ppi_node_features = ppi_feat_train
+            print(
+                f"[unseen-samples] PPI inductive features "
+                f"train/val/test shapes={tuple(ppi_feat_train.shape)}/"
+                f"{tuple(ppi_feat_val.shape)}/{tuple(ppi_feat_test.shape)}"
+            )
+        else:
+            ppi_node_features = ppi_extractor.extract_node_features().detach().cpu()
+            ppi_feat_train = ppi_feat_val = ppi_feat_test = ppi_node_features
         # Persist for case-study / transfer inference (PPINet weights are not in FusionModel ckpt).
         ppi_save = {
             "gene_list": list(gene_list),
             "features": ppi_node_features.contiguous(),
+            "features_train": None if ppi_feat_train is None else ppi_feat_train.contiguous(),
+            "features_val": None if ppi_feat_val is None else ppi_feat_val.contiguous(),
+            "features_test": None if ppi_feat_test is None else ppi_feat_test.contiguous(),
             "emb_dim": int(ppi_emb_dim),
             "ppi_csv": str(args.ppi_csv),
             "seed": int(args.seed),
+            "gene_disjoint": bool(gene_disjoint),
+            "train_gene_idx": g_tr,
         }
         ppi_path = os.path.join(run_dir, "ppi_node_features.pt")
         torch.save(ppi_save, ppi_path)
@@ -626,7 +829,7 @@ def main():
         pairs_train,
         seq_features,
         ppi_extractor,
-        ppi_node_features=ppi_node_features,
+        ppi_node_features=ppi_feat_train if ppi_feat_train is not None else ppi_node_features,
         device=None,
         use_ppi=use_ppi,
         use_expression=use_expr,
@@ -638,7 +841,7 @@ def main():
         pairs_val,
         seq_features,
         ppi_extractor,
-        ppi_node_features=ppi_node_features,
+        ppi_node_features=ppi_feat_val if ppi_feat_val is not None else ppi_node_features,
         device=None,
         use_ppi=use_ppi,
         use_expression=use_expr,
@@ -650,7 +853,7 @@ def main():
         pairs_test,
         seq_features,
         ppi_extractor,
-        ppi_node_features=ppi_node_features,
+        ppi_node_features=ppi_feat_test if ppi_feat_test is not None else ppi_node_features,
         device=None,
         use_ppi=use_ppi,
         use_expression=use_expr,
@@ -678,6 +881,7 @@ def main():
         use_cds=use_cds_modal,
         use_ppi=use_ppi,
         expression_gradient_checkpointing=args.expression_gradient_checkpointing,
+        expression_encoder=expr_enc,
     ).to(device)
     if args.compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -719,6 +923,7 @@ def main():
         num_workers=int(args.dataloader_num_workers),
         pin_memory=pin_memory,
     )
+    train_t0 = now_mono()
 
     best_val = -1.0
     best_path = os.path.join(run_dir, "best_model_fold0.pth")
@@ -738,6 +943,15 @@ def main():
             with _autocast_bf16(device, use_amp_bf16):
                 logits = _forward_logits(model, x)
             loss = criterion(logits.float(), y)
+            if (
+                use_expr
+                and expr_enc == "vae"
+                and (args.vae_beta > 0 or args.vae_recon_weight > 0)
+            ):
+                raw = getattr(model, "_orig_mod", model)
+                if hasattr(raw, "vae_aux_losses"):
+                    kl, recon = raw.vae_aux_losses()
+                    loss = loss + float(args.vae_beta) * kl.float() + float(args.vae_recon_weight) * recon.float()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -765,6 +979,8 @@ def main():
                 print(f"[Early Stop] patience={args.patience}, stop at epoch {ep+1}")
                 break
 
+    train_time_sec = float(now_mono() - train_t0)
+    eval_t0 = now_mono()
     model.load_state_dict(torch.load(best_path, map_location=device))
     val_metrics = _evaluate(
         model, val_loader, device, use_amp_bf16=use_amp_bf16, non_blocking=non_blocking
@@ -775,6 +991,7 @@ def main():
     y_test_true, y_test_prob = _predict_arrays(
         model, test_loader, device, use_amp_bf16=use_amp_bf16, non_blocking=non_blocking
     )
+    eval_time_sec = float(now_mono() - eval_t0)
 
     with open(os.path.join(run_dir, "unseen_samples_val_metrics.json"), "w", encoding="utf-8") as f:
         json.dump({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in val_metrics.items()}, f, ensure_ascii=False, indent=2)
@@ -854,7 +1071,39 @@ def main():
     print(f"[unseen-samples] best_model: {best_path}")
     print(f"[unseen-samples] val_acc={val_metrics['accuracy']:.4f}, test_acc={test_metrics['accuracy']:.4f}")
 
+    wall_time_sec = float(now_mono() - wall_t0)
+    try:
+        write_runtime_json(
+            run_dir,
+            wall_time_sec=wall_time_sec,
+            train_time_sec=train_time_sec,
+            eval_time_sec=eval_time_sec,
+            n_genes_used=int(len(gene_list)),
+            gene_policy="gene_disjoint" if gene_disjoint else "all_genes_pair_split",
+            extra={
+                "method": str(args.method_name),
+                "fold_idx": args.fold_idx,
+                "experiment_name": args.experiment_name,
+                "device": str(device),
+                "epochs_ran": int(len(epoch_hist)),
+                "batch_size": int(args.batch_size),
+                "n_cells_train": int(exp_tr.shape[1]),
+                "n_cells_val": int(exp_va.shape[1]),
+                "n_cells_test": int(exp_te.shape[1]),
+                "gene_disjoint": bool(gene_disjoint),
+                "expression_encoder": expr_enc,
+                "vae_beta": float(args.vae_beta) if expr_enc == "vae" else 0.0,
+                "vae_recon_weight": float(args.vae_recon_weight) if expr_enc == "vae" else 0.0,
+                "source": "train_unseen_samples_no_cv",
+            },
+        )
+        print(
+            f"[unseen-samples] runtime wall={wall_time_sec:.1f}s "
+            f"train={train_time_sec:.1f}s eval={eval_time_sec:.1f}s"
+        )
+    except Exception as ex:
+        print(f"[unseen-samples] warning: runtime.json write failed: {ex}")
+
 
 if __name__ == "__main__":
     main()
-

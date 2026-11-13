@@ -18,7 +18,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 
-from grn.data.pancancer_paths import genelink_fold_dir, step01_grn_csv
+from grn.data.pancancer_paths import genelink_fold_dir, resolve_external_project, step01_grn_csv
+from grn.utils.runtime import now_mono, write_runtime_json
 from grn.evaluation.confusion_matrix_io import export_confusion_matrix_artifacts
 from grn.scripts.pancancer_step01_binary import (
     binary_metrics_to_step01_json,
@@ -28,17 +29,21 @@ from grn.scripts.pancancer_step01_binary import (
     load_epithelial_expression,
     load_kegg_grn_dataframe,
     pairs_to_index_array,
+    pad_cell_features_to_max,
     select_kegg_priority_gene_subset,
     split_binary_pairs,
-    subsample_cols_to_common_length,
     subset_expression,
+    subset_expression_to_grn_genes,
 )
 
 BINARY_CLASS_NAMES = ("No regulation", "Regulation")
 
 
 def _default_genelink_code() -> Path:
-    return Path(__file__).resolve().parents[3] / "project_GENELink" / "Code"
+    found = resolve_external_project("GENELINK_CODE", "project_GENELink", "Code")
+    if found is not None:
+        return found
+    return Path(r"E:\project\project_GENELink\Code")
 
 
 def _import_genelink_modules(code_dir: Path):
@@ -59,7 +64,7 @@ def run_genelink_step01_fold(
     kegg_path: Path,
     genelink_code: Path,
     fold_dir: Path,
-    max_genes: int = 1500,
+    max_genes: int = 0,
     seed: int = 42,
     epochs: int = 20,
     batch_size: int = 256,
@@ -70,38 +75,33 @@ def run_genelink_step01_fold(
     num_head1: int = 3,
     num_head2: int = 3,
 ) -> Dict[str, float]:
+    t0 = now_mono()
     GENELink, scRNADataset, adj2saprse_tensor, Evaluation = _import_genelink_modules(genelink_code)
 
     gene_list, raw_expr = load_epithelial_expression(gse_id, grn_root)
     n_genes_full = len(gene_list)
-    if max_genes <= 0 or max_genes >= n_genes_full:
-        print(
-            f"[genelink-10cv] WARNING: full genome ({n_genes_full} genes) may OOM on 16GB GPU; "
-            f"forcing max_genes=1500.",
-            flush=True,
-        )
-        max_genes = 1500
-    if max_genes < n_genes_full:
+    gene_list, raw_expr = subset_expression_to_grn_genes(gene_list, raw_expr, kegg_path)
+    if max_genes > 0 and max_genes < len(gene_list):
         grn_df, tf_col, tg_col = load_kegg_grn_dataframe(gene_list, kegg_path)
         sub_genes = select_kegg_priority_gene_subset(
             gene_list, raw_expr, grn_df, tf_col, tg_col, max_genes, seed
         )
         gene_list, raw_expr = subset_expression(gene_list, raw_expr, sub_genes)
-        print(
-            f"[genelink-10cv] {gse_id} fold {fold_idx:02d}: genes {n_genes_full} -> {len(gene_list)} "
-            f"(max_genes={max_genes})",
-            flush=True,
-        )
+    print(
+        f"[genelink-10cv] {gse_id} fold {fold_idx:02d}: genes {n_genes_full} -> {len(gene_list)} (GRN-mapped)",
+        flush=True,
+    )
 
     grn_matrix = build_grn_matrix(gene_list, kegg_path)
     pairs_train, pairs_val, pairs_test = split_binary_pairs(grn_matrix, seed=seed, neg_ratio=1.0)
     train_cols, val_cols, test_cols = load_cv_column_splits(gse_id, fold_idx, grn_root)
-    col_rng = np.random.default_rng(int(seed) + int(fold_idx) - 1)
-    train_cols, val_cols, test_cols, dim_cells = subsample_cols_to_common_length(
-        train_cols, val_cols, test_cols, col_rng
+    feat_tr, feat_va, feat_te, dim_cells = pad_cell_features_to_max(
+        raw_expr, train_cols, val_cols, test_cols
     )
     print(
-        f"[genelink-10cv] {gse_id} fold {fold_idx:02d}: aligned cell cols -> {dim_cells}",
+        f"[genelink-10cv] {gse_id} fold {fold_idx:02d}: full cells "
+        f"train/val/test={len(train_cols)}/{len(val_cols)}/{len(test_cols)} "
+        f"(zero-pad input_dim={dim_cells}; no downsample)",
         flush=True,
     )
 
@@ -112,9 +112,9 @@ def run_genelink_step01_fold(
 
     device = torch.device("cuda:0" if device_s == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"[genelink-10cv] building tensors on {device} ...", flush=True)
-    feature_tr = torch.from_numpy(raw_expr[:, train_cols].astype(np.float32)).to(device)
-    feature_va = torch.from_numpy(raw_expr[:, val_cols].astype(np.float32)).to(device)
-    feature_te = torch.from_numpy(raw_expr[:, test_cols].astype(np.float32)).to(device)
+    feature_tr = torch.from_numpy(feat_tr).to(device)
+    feature_va = torch.from_numpy(feat_va).to(device)
+    feature_te = torch.from_numpy(feat_te).to(device)
 
     train_load = scRNADataset(train_arr, feature_tr.shape[0], flag=False)
     print("[genelink-10cv] generating adjacency (train pairs) ...", flush=True)
@@ -188,10 +188,33 @@ def run_genelink_step01_fold(
         y_pred=y_bin,
         cm=cm,
     )
+    gene_policy = "subset" if max_genes > 0 and max_genes < n_genes_full else "all_genes"
     metrics["n_genes_full"] = int(n_genes_full)
     metrics["n_genes_used"] = int(len(gene_list))
     metrics["max_genes"] = int(max_genes)
-    metrics["n_cells_aligned"] = int(dim_cells)
+    metrics["gene_policy"] = gene_policy
+    metrics["cell_policy"] = "full_cv_splits_pad_to_max"
+    metrics["n_cells_train"] = int(len(train_cols))
+    metrics["n_cells_val"] = int(len(val_cols))
+    metrics["n_cells_test"] = int(len(test_cols))
+    metrics["n_cells_input_dim"] = int(dim_cells)
+    write_runtime_json(
+        fold_dir,
+        wall_time_sec=float(now_mono() - t0),
+        n_genes_used=int(len(gene_list)),
+        gene_policy=gene_policy,
+        extra={
+            "gse_id": gse_id,
+            "fold": int(fold_idx),
+            "method": "GENELink",
+            "cell_policy": "full_cv_splits_pad_to_max",
+            "n_cells_train": int(len(train_cols)),
+            "n_cells_val": int(len(val_cols)),
+            "n_cells_test": int(len(test_cols)),
+            "n_cells_input_dim": int(dim_cells),
+            "sample_split": [5, 2, 3],
+        },
+    )
     (fold_dir / "unseen_samples_test_metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -228,8 +251,8 @@ def main() -> None:
     ap.add_argument(
         "--max-genes",
         type=int,
-        default=1500,
-        help="KEGG-priority gene cap (default 1500; full genome OOM on 16GB GPU).",
+        default=0,
+        help="Gene cap (<=0: all genes; refactor default). >0 uses KEGG-priority + variance fill.",
     )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=256)

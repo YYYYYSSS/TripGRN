@@ -28,3 +28,29 @@ shared/data/network/ppi/_string_vendor_dump/
 !shared/data/network/grn/*.csv
 !shared/data/network/ppi/ppi_string_v12_human_score900.csv
 !shared/data/features/cds/*.csv
+
+# ---- Non-code artifacts (manuscript, articles, backups) ----
+/manuscript*.docx
+/article/
+/backups/
+
+# ---- Logs / temp / packaging bundles ----
+/_logs_*.txt
+/_tmp_*/
+/tools/_pack_*/
+
+# Assembled manuscript figure tree (regenerated; source scripts live in figXX/scripts)
+/figure/
+
+# ---- Python build / cache ----
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

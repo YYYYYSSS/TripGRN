@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -287,7 +287,7 @@ def draw_macro_auc_boxplot_pdf(
     group_width = 0.78
     box_width = group_width / max(n_methods, 1)
     centers = np.arange(n_gse, dtype=float)
-    title_text = title or f"{network_label}: Macro-AUC (10-fold CV, unseen cells)"
+    title_text = title if title is not None else f"{network_label}: Macro-AUC (10-fold CV, unseen cells)"
     ylabel_text = ylabel or "Macro-AUC"
 
     def x_pt(x: float) -> float:
@@ -300,9 +300,10 @@ def draw_macro_auc_boxplot_pdf(
     c.setFillColor(white)
     c.rect(0, 0, w, h, fill=1, stroke=0)
 
-    c.setFillColor(black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(w / 2, h - 28, title_text)
+    if title_text:
+        c.setFillColor(black)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(w / 2, h - 28, title_text)
     if subtitle:
         c.setFont("Helvetica", 10)
         c.drawCentredString(w / 2, h - 44, subtitle)
@@ -398,8 +399,11 @@ def draw_threeclass_auc_boxplot_pdf(
     ymin: float,
     ymax: float,
     y_step: float = 0.1,
+    value_col: str = "auc",
+    ylabel: str = "AUC",
+    title: str | None = None,
 ) -> None:
-    """1x3 faceted OvR-AUC boxplot (TripGRN vs DeepFGRN), KEGG threeclass_auc_boxplot layout."""
+    """1x3 faceted per-class boxplot (TripGRN vs DeepFGRN), Fig.2B/D / S3–S4 layout."""
     w, h = BOX_W, BOX_H
     ml0, mr0, mt, mb = 54, 16, 52, 88
     gap = 14
@@ -416,18 +420,18 @@ def draw_threeclass_auc_boxplot_pdf(
     group_width = 0.55
     box_width = group_width / max(n_methods, 1)
     centers = np.arange(n_gse, dtype=float)
+    title_text = title if title is not None else f"{network_label}: 3-class OvR AUC by class (TripGRN vs DeepFGRN)"
 
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     c = canvas.Canvas(str(out_path), pagesize=(w, h))
     c.setFillColor(white)
     c.rect(0, 0, w, h, fill=1, stroke=0)
 
-    c.setFillColor(black)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawCentredString(
-        w / 2,
-        h - 26,
-        f"{network_label}: 3-class OvR AUC by class (TripGRN vs DeepFGRN)",
-    )
+    if title_text:
+        c.setFillColor(black)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawCentredString(w / 2, h - 26, title_text)
 
     for pi, cls in enumerate(CLASS_LABELS):
         left = ml0 + pi * (panel_w + gap)
@@ -466,7 +470,7 @@ def draw_threeclass_auc_boxplot_pdf(
             c.rotate(90)
             c.setFont("Helvetica", 11)
             c.setFillColor(black)
-            c.drawCentredString(0, 0, "AUC")
+            c.drawCentredString(0, 0, ylabel)
             c.restoreState()
 
         sub = df[df["class"] == cls]
@@ -475,7 +479,7 @@ def draw_threeclass_auc_boxplot_pdf(
             offsets = centers - group_width / 2 + box_width / 2 + mi * box_width
             bw = box_width * 0.82
             for gi, gse in enumerate(gse_ids):
-                vals = sub.loc[(sub["gse_id"] == gse) & (sub["method"] == method), "auc"].dropna().to_numpy(dtype=float)
+                vals = sub.loc[(sub["gse_id"] == gse) & (sub["method"] == method), value_col].dropna().to_numpy(dtype=float)
                 st = _box_stats(vals)
                 if not st:
                     continue
@@ -541,6 +545,7 @@ def draw_metric_radar_pdf(
     network_label: str,
     ymin: float = 0.0,
     ymax: float = 1.0,
+    title: Optional[str] = None,
 ) -> None:
     """Radar: each axis = one GSE; value = fold-mean; one polygon per method.
 
@@ -565,15 +570,17 @@ def draw_metric_radar_pdf(
     c.setFillColor(white)
     c.rect(0, 0, w, h, fill=1, stroke=0)
 
-    c.setFillColor(black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(w / 2, h - 36, f"{network_label}: {metric_label} radar")
-    c.setFont("Helvetica", 10)
-    c.drawCentredString(
-        w / 2,
-        h - 52,
-        f"Axes = datasets; values = 10-fold CV mean per GSE; scale [{ymin:.2f}, {ymax:.2f}]",
-    )
+    title_text = title if title is not None else f"{network_label}: {metric_label} radar"
+    if title_text:
+        c.setFillColor(black)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(w / 2, h - 36, title_text)
+        c.setFont("Helvetica", 10)
+        c.drawCentredString(
+            w / 2,
+            h - 52,
+            f"Axes = datasets; values = 10-fold CV mean per GSE; scale [{ymin:.2f}, {ymax:.2f}]",
+        )
 
     # rings + numeric scale labels (shared across all radar PDFs)
     ring_vals = [ymin + f * (ymax - ymin) for f in (0.25, 0.5, 0.75, 1.0)]
@@ -603,18 +610,21 @@ def draw_metric_radar_pdf(
         c.setFillColor(black)
         c.drawCentredString(lx, ly - 3, gse)
 
-    # method polygons
+    # method polygons (skip methods with no finite values — do not collapse NaN→ymin)
     for method in methods:
         sub = mean_df[mean_df["method"] == method]
         if sub.empty:
             continue
         gse_to_v = {str(r["gse_id"]): float(r["mean"]) for _, r in sub.iterrows()}
-        pts = []
-        for i, gse in enumerate(gse_ids):
-            v = gse_to_v.get(gse, float("nan"))
-            if not np.isfinite(v):
-                v = ymin
-            pts.append(polar(i, v))
+        vals = [gse_to_v.get(gse, float("nan")) for gse in gse_ids]
+        if not any(np.isfinite(v) for v in vals):
+            print(f"[radar] skip {method} for {metric_key}: all NaN (missing binary metric cache?)")
+            continue
+        if not all(np.isfinite(v) for v in vals):
+            n_nan = sum(1 for v in vals if not np.isfinite(v))
+            print(f"[radar] skip {method} for {metric_key}: {n_nan}/{len(vals)} NaN GSE means")
+            continue
+        pts = [polar(i, float(v)) for i, v in enumerate(vals)]
         color = method_colors.get(method, "#888888")
         p = c.beginPath()
         p.moveTo(pts[0][0], pts[0][1])

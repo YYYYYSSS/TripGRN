@@ -235,8 +235,13 @@ def _metric_ylim(
 
 def _save_figure(fig: plt.Figure, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=FIG_DPI, facecolor="white", edgecolor="none")
-    fig.savefig(out_path.with_suffix(".pdf"), facecolor="white", edgecolor="none")
+    fig.savefig(out_path, dpi=FIG_DPI, facecolor="white", edgecolor="none", bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), facecolor="white", edgecolor="none", bbox_inches="tight")
+
+
+def _safe_layout(fig: plt.Figure, *, bottom: float = 0.18, top: float = 0.92, left: float = 0.07, right: float = 0.99) -> None:
+    """Avoid fig.tight_layout(): it can hard-crash on some Windows/matplotlib builds."""
+    fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top)
 
 
 def _grouped_boxplot(
@@ -295,7 +300,7 @@ def _grouped_boxplot(
     plot_vals = df.loc[df["method"].isin(methods) & df["gse_id"].isin(gse_ids), value_col].to_numpy(dtype=float)
     ax.set_ylim(*_metric_ylim(plot_vals))
     ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=min(len(methods), 5), frameon=False)
-    fig.tight_layout()
+    _safe_layout(fig, bottom=0.22)
     _save_figure(fig, out_path)
     plt.close(fig)
 
@@ -350,9 +355,9 @@ def _faceted_class_method_boxplot(
 
     axes[0].set_ylabel(ylabel)
     handles = [Patch(facecolor=method_colors[m], alpha=0.75, label=m) for m in METHODS_3CLASS]
-    fig.suptitle(title_prefix, y=1.02, fontsize=13)
+    fig.suptitle(title_prefix, y=0.98, fontsize=13)
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=2, frameon=False)
-    fig.tight_layout()
+    _safe_layout(fig, bottom=0.20, top=0.88)
     _save_figure(fig, out_path)
     plt.close(fig)
 
@@ -404,7 +409,7 @@ def _faceted_prf_by_class_boxplot(df: pd.DataFrame, out_path: Path, method_color
     handles = [Patch(facecolor=method_colors[m], alpha=0.75, label=m) for m in METHODS_3CLASS]
     fig.suptitle("3-class per-class comparison: Accuracy / Precision / Recall (10 folds per GSE)", y=0.995)
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=2, frameon=False)
-    fig.tight_layout(rect=(0, 0.03, 1, 0.98))
+    _safe_layout(fig, bottom=0.08, top=0.92)
     _save_figure(fig, out_path)
     plt.close(fig)
 

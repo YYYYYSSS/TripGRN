@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GSE253718 ablation experiment paths (10-fold CV)."""
+"""GSE253718 modality-ablation paths (Fig.2) — prefer fig02_modality_ablation/."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 DEFAULT_ABLATION_EXPERIMENT = "gse253718_ablation_epithelial_10cv_seed42"
+FIG02_DIRNAME = "fig02_modality_ablation"
 
 # (stage_dir, display_label, extra CLI flags for train_unseen_samples_no_cv)
 ABLATION_STAGES: List[Tuple[str, str, List[str]]] = [
@@ -24,24 +25,55 @@ def grn_root_from_here() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def fig02_root(grn_root: Path | None = None) -> Path:
+    return Path(grn_root or grn_root_from_here()).resolve() / FIG02_DIRNAME
+
+
 def gse253718_layout(grn_root: Path | None = None) -> Dict[str, Path]:
+    """Resolve expression / GRN / PPI / experiment dirs (fig02 first, then shared / legacy shim)."""
     root = Path(grn_root or grn_root_from_here()).resolve()
-    full_prefix = root / "data" / "exp" / "GSE253718_exp_counts"
-    epi_prefix = root / "data" / "exp" / "GSE253718_epithelial_counts"
-    abl_base = root / "experiments" / DEFAULT_ABLATION_EXPERIMENT
+    fig02 = fig02_root(root)
+    epi = fig02 / "data" / "expression" / "GSE253718_epithelial"
+    shared_grn = root / "shared" / "data" / "network" / "grn"
+    shared_ppi = root / "shared" / "data" / "network" / "ppi"
+    shared_cds = root / "shared" / "data" / "features" / "cds"
+    abl_base = fig02 / "experiments" / DEFAULT_ABLATION_EXPERIMENT
+
+    def _pick(*cands: Path) -> Path:
+        for p in cands:
+            if p.is_file() or p.is_dir():
+                return p.resolve()
+        return cands[0].resolve()
+
     return {
         "grn_root": root,
-        "exp_values_full": full_prefix.with_name(full_prefix.name + "_values.npy"),
-        "exp_genes_full": full_prefix.with_name(full_prefix.name + "_genes.npy"),
-        "exp_values": epi_prefix.with_name(epi_prefix.name + "_values.npy"),
-        "exp_genes": epi_prefix.with_name(epi_prefix.name + "_genes.npy"),
-        "exp_cells": epi_prefix.with_name(epi_prefix.name + "_cells.npy"),
-        "exp_csv": root / "data" / "exp" / "GSE253718_exp_counts.csv",
-        "epithelial_dir": root / "data" / "exp" / "GSE253718_epithelial",
-        "cv_splits": root / "data" / "exp" / "GSE253718_epithelial_cv_splits_10fold.json",
-        "grn_csv": root / "data" / "network" / "grn" / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
-        "cds_gene": root / "data" / "CDS" / "features" / "gene_shared" / "cds_gene_feature_k4.csv",
-        "ppi_csv": root / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+        "fig02": fig02,
+        "exp_values": _pick(epi / "values.npy", root / "data" / "exp" / "GSE253718_epithelial_counts_values.npy"),
+        "exp_genes": _pick(epi / "genes.npy", root / "data" / "exp" / "GSE253718_epithelial_counts_genes.npy"),
+        "exp_cells": _pick(epi / "cells.npy", root / "data" / "exp" / "GSE253718_epithelial_counts_cells.npy"),
+        "cv_splits": _pick(
+            fig02 / "data" / "splits" / "cv_splits_10fold.json",
+            root / "data" / "exp" / "GSE253718_epithelial_cv_splits_10fold.json",
+        ),
+        "grn_csv": _pick(
+            fig02 / "data" / "network" / "grn" / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
+            shared_grn / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
+        ),
+        "cds_gene": _pick(
+            fig02 / "data" / "features" / "cds" / "cds_gene_feature_k4.csv",
+            shared_cds / "cds_gene_feature_k4.csv",
+        ),
+        # Fig.2 default PPI = raw STRING; nokegg kept for optional pilot (--ppi-nokegg).
+        "ppi_csv": _pick(
+            fig02 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900_nokegg.csv",
+            shared_ppi / "ppi_string_v12_human_score900_nokegg.csv",
+            fig02 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+            shared_ppi / "ppi_string_v12_human_score900.csv",
+        ),
+        "ppi_csv_raw": _pick(
+            fig02 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+            shared_ppi / "ppi_string_v12_human_score900.csv",
+        ),
         "experiment_base": abl_base,
         "summary_dir": abl_base / "summary",
         "figures_dir": abl_base / "figures",

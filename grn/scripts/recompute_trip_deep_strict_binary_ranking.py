@@ -24,9 +24,45 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from grn.data.pancancer_paths import PANCANCER_GSE_IDS, grn_root_from_here
+from grn.data.pancancer_paths import (
+    PANCANCER_GSE_IDS,
+    fig01_root,
+    grn_root_from_here,
+    step01_grn_csv,
+)
 
 METHODS = ("TripGRN", "DeepFGRN")
+
+
+def _build_pair_samples_genome_wide(grn_matrix, neg_ratio: float, seed: int):
+    """Legacy TripGRN negatives: any non-edge gene pair (not positive-universe matched).
+
+    Fig.1 Trip checkpoints were trained with this sampler; matched-universe rebuild
+    yields a different held-out test set and breaks AUC==NoReg-OvR checks.
+    """
+    import torch
+
+    rng = np.random.RandomState(seed)
+    pos = torch.where(grn_matrix > 0)
+    pos_pairs = [
+        (int(i.item()), int(j.item()), int(grn_matrix[i, j].item()))
+        for i, j in zip(pos[0], pos[1])
+    ]
+    n_pos = len(pos_pairs)
+    n_neg = int(n_pos * neg_ratio)
+    num_genes = int(grn_matrix.shape[0])
+    existing = set((i, j) for i, j, _ in pos_pairs)
+    neg_pairs = []
+    while len(neg_pairs) < n_neg:
+        i = int(rng.randint(0, num_genes))
+        j = int(rng.randint(0, num_genes))
+        if (i, j) in existing:
+            continue
+        if int(grn_matrix[i, j].item()) != 0:
+            continue
+        neg_pairs.append((i, j, 0))
+        existing.add((i, j))
+    return pos_pairs + neg_pairs
 
 
 def _binary_ranking(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple[float, float]:
@@ -46,6 +82,8 @@ def _binary_ranking(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple[float, floa
 
 
 def _trip_one(fold_dir: str) -> Dict[str, Any]:
+    from grn.data.pancancer_cv import get_fold_split, load_cv_splits
+    import grn.scripts.regenerate_unseen_run_plots_from_checkpoint as regen
     from grn.scripts.regenerate_unseen_run_plots_from_checkpoint import (
         _build_pipeline,
         _validate_args_like_train,
@@ -58,23 +96,44 @@ def _trip_one(fold_dir: str) -> Dict[str, Any]:
     args = Namespace(**cfg)
     _validate_args_like_train(args)
     set_seed(int(args.seed))
-    model, _, _, test_loader, device, use_amp = _build_pipeline(args)
+    # Must use the same shared CV cell columns as training; default split3 is wrong for Fig.1.
+    column_splits = None
+    if getattr(args, "cv_splits_json", None) and int(getattr(args, "fold_idx", 0) or 0) >= 1:
+        cv_payload = load_cv_splits(Path(str(args.cv_splits_json)))
+        fold = get_fold_split(cv_payload, int(args.fold_idx))
+        column_splits = (
+            np.asarray(fold["train_cols"], dtype=np.int64),
+            np.asarray(fold["val_cols"], dtype=np.int64),
+            np.asarray(fold["test_cols"], dtype=np.int64),
+        )
+    # Trip Fig.1 folds used genome-wide negatives at train time.
+    _orig_pairs = regen._build_pair_samples
+    regen._build_pair_samples = _build_pair_samples_genome_wide  # type: ignore[attr-defined]
+    try:
+        model, _, _, test_loader, device, use_amp = _build_pipeline(
+            args, column_splits=column_splits
+        )
+    finally:
+        regen._build_pair_samples = _orig_pairs  # type: ignore[attr-defined]
     state = torch.load(str(run / "best_model_fold0.pth"), map_location=device)
     model.load_state_dict(state)
     model.eval()
     y_true, y_prob = _predict_arrays(model, test_loader, device, use_amp_bf16=use_amp)
     auc, auprc = _binary_ranking(y_true, y_prob)
     # parse gse/fold from path .../TripGRN/GSExxx/fold_YY
-    fold = int(run.name.split("_")[1])
+    fold_idx = int(run.name.split("_")[1])
     gse = run.parent.name
     return {
         "method": "TripGRN",
         "gse_id": gse,
-        "fold": fold,
+        "fold": fold_idx,
         "auc": auc,
         "auprc": auprc,
         "status": "ok",
         "fold_dir": str(run),
+        "used_cv_splits": bool(column_splits is not None),
+        "negative_protocol": "genome_wide_legacy_trip",
+        "n_test": int(len(y_true)),
     }
 
 
@@ -93,6 +152,10 @@ def _deep_one(payload: Dict[str, str]) -> Dict[str, Any]:
 
     v_path, g_path, _ = gse_npy_triplet("epithelial", gse, grn_root)
     cv_path = cv_splits_path(gse, grn_root)
+    metrics_path = fold_dir / "unseen_samples_test_metrics.json"
+    cm_path = fold_dir / "confusion_matrix_test.json"
+    metrics_bak = metrics_path.read_bytes() if metrics_path.is_file() else None
+    cm_bak = cm_path.read_bytes() if cm_path.is_file() else None
     with tempfile.TemporaryDirectory(prefix="deep_bin_") as tmp:
         tmp_p = Path(tmp)
         cmd = [
@@ -123,7 +186,34 @@ def _deep_one(payload: Dict[str, str]) -> Dict[str, Any]:
         cmd[0] = str(Path(payload["python"]))
         env = os.environ.copy()
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-        proc = subprocess.run(cmd, cwd=str(grn_root), env=env, check=False, capture_output=True, text=True)
+        env["STEP01_EXPERIMENTS_NAME"] = str(exp_name)
+        # Never rewrite fold metrics during AUPRC recompute (cm-only uses wrong GRN if mis-set).
+        env["DEEPFGRN_PRESERVE_METRICS"] = "1"
+        grn_csv = payload.get("grn_csv") or ""
+        if not grn_csv and "dorothea" in str(exp_name).lower():
+            raise RuntimeError(
+                f"DoRothEA Deep AUPRC recompute requires grn_csv in payload (got experiment={exp_name})"
+            )
+        if grn_csv:
+            env["STEP01_GRN_CSV"] = str(grn_csv)
+            cmd.extend(["--kegg-csv", str(grn_csv)])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(grn_root),
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        finally:
+            # Always restore original metrics/CM even if subprocess rewrote them.
+            if metrics_bak is not None:
+                metrics_path.write_bytes(metrics_bak)
+            if cm_bak is not None:
+                cm_path.write_bytes(cm_bak)
         y_true_p = tmp_p / "test_y_true.npy"
         y_prob_p = tmp_p / "test_y_prob.npy"
         if not y_true_p.is_file() or not y_prob_p.is_file():
@@ -136,6 +226,7 @@ def _deep_one(payload: Dict[str, str]) -> Dict[str, Any]:
                 "status": f"fail_exit={proc.returncode}",
                 "fold_dir": str(fold_dir),
                 "stderr": (proc.stderr or "")[-2000:],
+                "grn_csv": str(grn_csv) if grn_csv else "",
             }
         y_true = np.load(y_true_p)
         y_prob = np.load(y_prob_p)
@@ -150,10 +241,13 @@ def _deep_one(payload: Dict[str, str]) -> Dict[str, Any]:
             "status": "ok",
             "fold_dir": str(fold_dir),
             "experiment_name": exp_name,
+            "grn_csv": str(grn_csv) if grn_csv else "",
         }
 
 
-def _discover_jobs(exp_root: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+def _discover_jobs(
+    exp_root: Path, *, grn_csv: Optional[Path] = None
+) -> Tuple[List[str], List[Dict[str, str]]]:
     trip_dirs: List[str] = []
     deep_jobs: List[Dict[str, str]] = []
     for method in METHODS:
@@ -168,14 +262,15 @@ def _discover_jobs(exp_root: Path) -> Tuple[List[str], List[Dict[str, str]]]:
                         trip_dirs.append(str(fd))
                 else:
                     if (fd / "best_model.keras").is_file():
-                        deep_jobs.append(
-                            {
-                                "fold_dir": str(fd),
-                                "gse_id": gse,
-                                "fold": str(fold),
-                                "experiment_name": exp_root.name,
-                            }
-                        )
+                        job = {
+                            "fold_dir": str(fd),
+                            "gse_id": gse,
+                            "fold": str(fold),
+                            "experiment_name": exp_root.name,
+                        }
+                        if grn_csv is not None:
+                            job["grn_csv"] = str(grn_csv)
+                        deep_jobs.append(job)
     return trip_dirs, deep_jobs
 
 
@@ -194,16 +289,44 @@ def main() -> None:
         py = sys.executable
 
     exps = args.experiment_name or [
-        "step01_pancancer_epithelial_10cv",
-        "step01_pancancer_epithelial_10cv_dorothea_abc",
+        "kegg_epithelial_10cv",
+        "dorothea_abc_epithelial_10cv",
     ]
     want = {m.strip() for m in str(args.methods).split(",") if m.strip()}
 
     for exp in exps:
-        exp_root = root / "experiments" / exp
+        # Fig.1 layout: fig01_pancancer_benchmark/experiments/<exp>/
+        exp_root = fig01_root(root) / "experiments" / exp
+        if not exp_root.is_dir():
+            # Legacy flat experiments/ fallback
+            alt = root / "experiments" / exp
+            exp_root = alt if alt.is_dir() else exp_root
         out_cache = exp_root / "summary" / "trip_deep_strict_binary_ranking_cache.csv"
         out_cache.parent.mkdir(parents=True, exist_ok=True)
-        trip_dirs, deep_jobs = _discover_jobs(exp_root)
+        grn_csv: Optional[Path] = None
+        if "dorothea" in exp.lower():
+            # Must match fig01 run_fig01_deepfgrn_dorothea._dorothea_csv order:
+            # training embeddings are keyed by GRN stem (DoRothEA_human_ABC_... vs dorothea_abc_...).
+            candidates = [
+                root / "shared" / "data" / "network" / "grn" / "DoRothEA_human_ABC_activation_inhibition_with_symbols.csv",
+                root / "shared" / "data" / "network" / "grn" / "dorothea_abc_activation_inhibition.csv",
+                fig01_root(root)
+                / "data"
+                / "network"
+                / "grn"
+                / "DoRothEA_human_ABC_activation_inhibition_with_symbols.csv",
+                fig01_root(root) / "data" / "network" / "grn" / "dorothea_abc_activation_inhibition.csv",
+            ]
+            for p in candidates:
+                if p.is_file():
+                    grn_csv = p
+                    break
+            if grn_csv is None:
+                raise FileNotFoundError(
+                    f"DoRothEA GRN CSV not found for {exp}; refused to fall back to KEGG"
+                )
+            print(f"[DeepFGRN] using GRN CSV: {grn_csv}")
+        trip_dirs, deep_jobs = _discover_jobs(exp_root, grn_csv=grn_csv)
         if args.max_jobs > 0:
             trip_dirs = trip_dirs[: args.max_jobs]
             deep_jobs = deep_jobs[: args.max_jobs]

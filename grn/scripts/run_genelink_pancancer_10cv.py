@@ -18,6 +18,7 @@ from grn.data.pancancer_paths import (
     gse_npy_triplet,
 )
 from grn.training.pair_dataloader import suggest_batch_size
+from grn.utils.runtime import now_mono, stamp_orchestrator_runtime
 
 
 def _resolve_folds(fold_arg: str, n_folds: int) -> List[int]:
@@ -52,7 +53,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=0)
     ap.add_argument("--batch-size-cap", type=int, default=256)
-    ap.add_argument("--max-genes", type=int, default=1500, help="KEGG-priority cap (default 1500; full genome OOM on 16GB)")
+    ap.add_argument("--max-genes", type=int, default=0, help="Gene cap (<=0: all genes; refactor default)")
     ap.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     args = ap.parse_args()
 
@@ -99,8 +100,24 @@ def main() -> None:
                 "--device",
                 str(args.device),
             ]
-            print(f"[genelink-10cv] run {gse} fold {fold_idx:02d} (train_cols={n_train}, batch={batch_size})")
+            print(
+                f"[genelink-10cv] run {gse} fold {fold_idx:02d} "
+                f"(train_cols={n_train}, batch={batch_size}, max_genes={args.max_genes})"
+            )
+            t0 = now_mono()
             proc = subprocess.run(cmd, check=False, cwd=str(grn_root))
+            stamp_orchestrator_runtime(
+                run_dir,
+                float(now_mono() - t0),
+                method="GENELink",
+                gse=gse,
+                fold_idx=fold_idx,
+                extra={
+                    "batch_size": int(batch_size),
+                    "max_genes": int(args.max_genes),
+                    "cell_policy": "full_cv_splits_pad_to_max",
+                },
+            )
             if _fold_done(run_dir):
                 if proc.returncode != 0:
                     print(

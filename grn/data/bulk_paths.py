@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TCGA bulk cross-cancer experiment paths (10-fold CV)."""
+"""TCGA bulk cross-cancer paths (Fig.3) — prefer fig03_bulk_cross_cancer/."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 DEFAULT_BULK_EXPERIMENT = "bulk_tcga_10cv_seed42"
+FIG03_DIRNAME = "fig03_bulk_cross_cancer"
 
-# 12 TCGA cancers from historical Step03 bulk runs (experiments/old/Bulk/repro_extval_*)
+# 12 TCGA cancers from historical Step03 bulk runs
 TCGA_CANCER_IDS: List[str] = [
     "TCGA-BRCA",
     "TCGA-COAD",
@@ -34,6 +35,10 @@ def grn_root_from_here() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def fig03_root(grn_root: Optional[Path] = None) -> Path:
+    return Path(grn_root or grn_root_from_here()).resolve() / FIG03_DIRNAME
+
+
 def _normalize_cancer_id(cancer_id: str) -> str:
     code = str(cancer_id).strip()
     if not code.upper().startswith("TCGA-"):
@@ -42,20 +47,62 @@ def _normalize_cancer_id(cancer_id: str) -> str:
 
 
 def bulk_layout(grn_root: Optional[Path] = None) -> Dict[str, Path]:
+    """Resolve expression / GRN / PPI / experiment dirs (fig03 first, then shared / shim)."""
     root = Path(grn_root or grn_root_from_here()).resolve()
-    base = root / "experiments" / DEFAULT_BULK_EXPERIMENT
+    fig03 = fig03_root(root)
+    shared_grn = root / "shared" / "data" / "network" / "grn"
+    shared_ppi = root / "shared" / "data" / "network" / "ppi"
+    shared_cds = root / "shared" / "data" / "features" / "cds"
+    abl_base = fig03 / "experiments" / DEFAULT_BULK_EXPERIMENT
+
+    def _pick(*cands: Path) -> Path:
+        for p in cands:
+            if p.is_file() or p.is_dir():
+                return p.resolve()
+        return cands[0].resolve()
+
     return {
         "grn_root": root,
-        "experiment_base": base,
-        "summary_dir": base / "summary",
-        "figures_dir": base / "figures",
-        "cv_splits_dir": root / "data" / "external_validation" / "cv_splits",
+        "fig03": fig03,
+        "experiment_base": abl_base,
+        "summary_dir": abl_base / "summary",
+        "figures_dir": abl_base / "figures",
+        "cv_splits_dir": _pick(
+            fig03 / "data" / "splits",
+            root / "data" / "external_validation" / "cv_splits",
+        ),
         "external_validation_dir": root / "data" / "external_validation",
-        "bulk_exp_dir": root / "data" / "exp" / "12bulk",
-        "grn_csv": root / "data" / "network" / "grn" / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
-        "cds_gene": root / "data" / "CDS" / "features" / "gene_shared" / "cds_gene_feature_k4.csv",
-        "tss_gene": root / "data" / "CDS" / "features" / "gene_shared" / "tss_gene_feature_k4.csv",
-        "ppi_csv": root / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+        "bulk_exp_dir": _pick(
+            fig03 / "data" / "expression",
+            root / "data" / "exp" / "12bulk",
+        ),
+        "grn_csv": _pick(
+            fig03 / "data" / "network" / "grn" / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
+            shared_grn / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
+            root / "data" / "network" / "grn" / "KEGG_hsa_PPrel_activation_inhibition_with_symbols.csv",
+        ),
+        "cds_gene": _pick(
+            fig03 / "data" / "features" / "cds" / "cds_gene_feature_k4.csv",
+            shared_cds / "cds_gene_feature_k4.csv",
+            root / "data" / "CDS" / "features" / "gene_shared" / "cds_gene_feature_k4.csv",
+        ),
+        # Fig.3 original protocol requires TSS; Fig.1/2 mainline does not.
+        "tss_gene": _pick(
+            fig03 / "data" / "features" / "cds" / "tss_gene_feature_k4.csv",
+            shared_cds / "tss_gene_feature_k4.csv",
+            root / "data" / "CDS" / "features" / "gene_shared" / "tss_gene_feature_k4.csv",
+        ),
+        # nokegg optional; Fig.3 original uses ppi_csv_raw
+        "ppi_csv": _pick(
+            fig03 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900_nokegg.csv",
+            shared_ppi / "ppi_string_v12_human_score900_nokegg.csv",
+            fig03 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+            shared_ppi / "ppi_string_v12_human_score900.csv",
+        ),
+        "ppi_csv_raw": _pick(
+            fig03 / "data" / "network" / "ppi" / "ppi_string_v12_human_score900.csv",
+            shared_ppi / "ppi_string_v12_human_score900.csv",
+        ),
     }
 
 
@@ -77,11 +124,10 @@ def _rewrite_legacy_path(path: Path, grn_root: Path) -> Path:
 def _candidate_exp_csvs(cancer_id: str, grn_root: Path) -> Sequence[Path]:
     """
     Search order:
-      1) data/exp/12bulk/TCGA-XXX_FPKM_Symbol.csv           (project bulk bundle)
-      2) data/external_validation/TCGA-XXX_FPKM_Symbol.csv  (historical Step03)
-      3) data/exp/TCGA-XXX_FPKM_Symbol.csv                (step01 LUAD step2)
-      4) data/external_validation/**/raw/...
-      5) TCGA_BULK_DATA_ROOT env override
+      1) fig03/.../expression/TCGA-XXX_FPKM_Symbol.csv
+      2) data/exp/12bulk/...
+      3) data/external_validation/...
+      4) TCGA_BULK_DATA_ROOT env override
     """
     code = _normalize_cancer_id(cancer_id)
     stem = f"{code}_FPKM_Symbol.csv"
@@ -96,6 +142,8 @@ def _candidate_exp_csvs(cancer_id: str, grn_root: Path) -> Sequence[Path]:
     candidates.extend(
         [
             layout["bulk_exp_dir"] / stem,
+            fig03_root(grn_root) / "data" / "expression" / stem,
+            grn_root / "data" / "exp" / "12bulk" / stem,
             layout["external_validation_dir"] / stem,
             grn_root / "data" / "exp" / stem,
             layout["external_validation_dir"] / underscored / "raw" / stem,
@@ -113,7 +161,6 @@ def _candidate_exp_csvs(cancer_id: str, grn_root: Path) -> Sequence[Path]:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # de-dup while preserving order
     seen: set[str] = set()
     out: List[Path] = []
     for c in candidates:
@@ -131,9 +178,10 @@ def bulk_exp_csv(cancer_id: str, grn_root: Optional[Path] = None) -> Path:
             return p
     code = _normalize_cancer_id(cancer_id)
     stem = f"{code}_FPKM_Symbol.csv"
-    matches = sorted((root / "data").rglob(stem))
-    if matches:
-        return matches[0]
+    matches = sorted((root / "data").rglob(stem)) if (root / "data").is_dir() else []
+    fig_matches = sorted((fig03_root(root) / "data").rglob(stem)) if (fig03_root(root) / "data").is_dir() else []
+    for m in fig_matches + matches:
+        return m
     return _candidate_exp_csvs(cancer_id, root)[0]
 
 

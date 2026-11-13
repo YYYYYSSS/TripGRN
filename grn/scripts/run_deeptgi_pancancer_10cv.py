@@ -18,6 +18,7 @@ from grn.data.pancancer_paths import (
     gse_npy_triplet,
 )
 from grn.training.pair_dataloader import suggest_batch_size
+from grn.utils.runtime import now_mono, stamp_orchestrator_runtime
 
 
 def _resolve_folds(fold_arg: str, n_folds: int) -> List[int]:
@@ -52,7 +53,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=0)
     ap.add_argument("--batch-size-cap", type=int, default=512)
-    ap.add_argument("--max-genes", type=int, default=1500, help="KEGG-priority cap (2×N PCC features; default 1500)")
+    ap.add_argument("--max-genes", type=int, default=0, help="Gene cap (<=0: all genes; refactor default)")
     ap.add_argument("--cuda-device", type=str, default="0")
     args = ap.parse_args()
 
@@ -99,8 +100,20 @@ def main() -> None:
                 "--max-genes",
                 str(args.max_genes),
             ]
-            print(f"[deeptgi-10cv] run {gse} fold {fold_idx:02d} (train_cols={n_train}, batch={batch_size})")
+            print(
+                f"[deeptgi-10cv] run {gse} fold {fold_idx:02d} "
+                f"(train_cols={n_train}, batch={batch_size}, max_genes={args.max_genes})"
+            )
+            t0 = now_mono()
             proc = subprocess.run(cmd, check=False, cwd=str(grn_root))
+            stamp_orchestrator_runtime(
+                run_dir,
+                float(now_mono() - t0),
+                method="DeepTGI",
+                gse=gse,
+                fold_idx=fold_idx,
+                extra={"batch_size": int(batch_size), "max_genes": int(args.max_genes)},
+            )
             if _fold_done(run_dir):
                 if proc.returncode != 0:
                     print(

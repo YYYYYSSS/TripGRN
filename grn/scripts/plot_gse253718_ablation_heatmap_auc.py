@@ -899,11 +899,17 @@ def main() -> None:
 
     layout = gse253718_layout()
     grn_root = layout["grn_root"]
-    exp_base = grn_root / "experiments" / args.experiment_name
+    # Prefer fig02_modality_ablation/experiments/... (layout["experiment_base"])
+    exp_base = layout["experiment_base"]
+    if args.experiment_name and args.experiment_name != DEFAULT_ABLATION_EXPERIMENT:
+        # Allow override while still resolving under fig02 first, then repo experiments/
+        cand = layout["fig02"] / "experiments" / args.experiment_name
+        exp_base = cand if cand.is_dir() else (grn_root / "experiments" / args.experiment_name)
     summary_csv = exp_base / "summary" / "ablation_10cv_stage_mean_std.csv"
     fold_csv = exp_base / "summary" / "ablation_10cv_fold_metrics.csv"
     figures_dir = exp_base / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[plot-ablation] exp_base={exp_base}", flush=True)
 
     if args.test_raw:
         if not summary_csv.is_file():

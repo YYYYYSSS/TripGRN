@@ -160,6 +160,25 @@ def subset_expression(gene_list: List[str], raw_expr: np.ndarray, keep: List[str
     return list(keep), np.asarray(raw_expr[idx, :], dtype=np.float32)
 
 
+def subset_expression_to_grn_genes(
+    gene_list: List[str],
+    raw_expr: np.ndarray,
+    grn_path: Path,
+) -> Tuple[List[str], np.ndarray]:
+    """Keep only genes that appear on mapped gold-standard edges (current GRN CSV)."""
+    grn_df, tf_col, tg_col = load_kegg_grn_dataframe(gene_list, grn_path)
+    keep = {str(a).strip() for a in grn_df[tf_col]} | {str(b).strip() for b in grn_df[tg_col]}
+    sub: List[str] = []
+    seen = set()
+    for g in gene_list:
+        if g in keep and g not in seen:
+            seen.add(g)
+            sub.append(g)
+    if len(sub) < 2:
+        raise ValueError(f"Fewer than 2 GRN genes mapped to expression ({len(sub)})")
+    return subset_expression(gene_list, raw_expr, sub)
+
+
 def estimate_scmgat_dense_adj_gb(n_genes: int) -> float:
     """Rough dense N×N adj + attention footprint (GB, float32)."""
     n = int(n_genes)
@@ -203,7 +222,10 @@ def subsample_cols_to_common_length(
     test_cols: np.ndarray,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Align train/val/test column counts (DeepFGRN / scMGATGRN fixed input_dim)."""
+    """Align train/val/test column counts by downsampling (DeepFGRN CorrResNet only).
+
+    Fig.1 binary baselines must not call this; use ``pad_cell_features_to_max`` instead.
+    """
     m = int(min(len(train_cols), len(val_cols), len(test_cols)))
     if m <= 0:
         raise ValueError("Empty train/val/test column split after CV")
@@ -212,6 +234,31 @@ def subsample_cols_to_common_length(
         return rng.choice(arr, size=m, replace=False) if len(arr) > m else arr
 
     return _pick(train_cols), _pick(val_cols), _pick(test_cols), m
+
+
+def pad_cell_features_to_max(
+    raw_expr: np.ndarray,
+    train_cols: np.ndarray,
+    val_cols: np.ndarray,
+    test_cols: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Keep every CV cell; zero-pad shorter splits so GAT ``input_dim`` matches.
+
+    Does not drop cells or genes. Typical 5:2:3 splits pad val/test to n_train.
+    """
+    n_tr, n_va, n_te = int(len(train_cols)), int(len(val_cols)), int(len(test_cols))
+    n_max = int(max(n_tr, n_va, n_te))
+    if n_max <= 0:
+        raise ValueError("Empty train/val/test column split after CV")
+
+    def _take_pad(cols: np.ndarray) -> np.ndarray:
+        feat = np.asarray(raw_expr[:, cols], dtype=np.float32)
+        if feat.shape[1] == n_max:
+            return feat
+        pad = np.zeros((feat.shape[0], n_max - feat.shape[1]), dtype=np.float32)
+        return np.concatenate([feat, pad], axis=1)
+
+    return _take_pad(train_cols), _take_pad(val_cols), _take_pad(test_cols), n_max
 
 
 def pairs_to_gene_label_df(pairs: Sequence[Tuple[int, int, int]], gene_list: List[str]) -> pd.DataFrame:

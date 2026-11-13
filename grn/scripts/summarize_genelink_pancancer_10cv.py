@@ -22,6 +22,16 @@ def _load_fold_metrics(run_dir: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def _runtime_wall(run_dir: Path) -> float:
+    p = run_dir / "runtime.json"
+    if not p.is_file():
+        return float("nan")
+    try:
+        return float(json.loads(p.read_text(encoding="utf-8")).get("wall_time_sec", float("nan")))
+    except Exception:
+        return float("nan")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Summarize GENELink pancancer 10-fold CV")
     ap.add_argument("--gse", default="ALL")
@@ -47,6 +57,10 @@ def main() -> None:
             for k in METRIC_KEYS:
                 row[k] = m.get(k, np.nan)
             row["confusion_matrix"] = json.dumps(m.get("confusion_matrix"))
+            row["n_genes_used"] = m.get("n_genes_used", np.nan)
+            row["gene_policy"] = m.get("gene_policy", "")
+            row["n_cells_train"] = m.get("n_cells_train", np.nan)
+            row["wall_time_sec"] = _runtime_wall(run_dir)
             fold_rows.append(row)
             gse_metrics.append(m)
         if not gse_metrics:
@@ -56,6 +70,9 @@ def main() -> None:
             vals = [float(x.get(k, np.nan)) for x in gse_metrics if k in x]
             agg[f"{k}_mean"] = float(np.nanmean(vals)) if vals else np.nan
             agg[f"{k}_std"] = float(np.nanstd(vals)) if vals else np.nan
+        wall_vals = [float(r["wall_time_sec"]) for r in fold_rows if r["gse_id"] == gse]
+        agg["wall_time_sec_mean"] = float(np.nanmean(wall_vals)) if wall_vals else float("nan")
+        agg["wall_time_sec_sum"] = float(np.nansum(wall_vals)) if wall_vals else float("nan")
         gse_summaries.append(agg)
 
     if fold_rows:

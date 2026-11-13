@@ -32,15 +32,17 @@ from grn.scripts.plot_step01_trrust_metrics import (
 EXCLUDE_GSE = {"GSE145825"}
 
 # Binary 5-method radars (overwrite existing radar_*.pdf names where applicable).
-BINARY_RADAR_SPECS: List[Tuple[str, str, str]] = [
-    # metric_col, metric_label, out_stem
-    ("accuracy", "Accuracy (binary)", "radar_accuracy"),
-    ("precision", "Precision (binary)", "radar_precision"),
-    ("recall", "Recall (binary)", "radar_recall"),
-    ("f1", "F1 (binary)", "radar_f1"),
-    ("mcc", "MCC (binary)", "radar_mcc"),
-    ("auprc", "AUPRC (binary)", "radar_auprc"),
-    ("auc", "AUC (binary)", "radar_auc"),
+# Each spec: metric_col, metric_label, out_stem, ymin, ymax
+# MCC can be negative — keep [-1, 1] so GENELink/scMGAT near-zero lines stay visible
+# (they collapse to the origin if clamped to [0, 1]).
+BINARY_RADAR_SPECS: List[Tuple[str, str, str, float, float]] = [
+    ("accuracy", "Accuracy (binary)", "radar_accuracy", 0.0, 1.0),
+    ("precision", "Precision (binary)", "radar_precision", 0.0, 1.0),
+    ("recall", "Recall (binary)", "radar_recall", 0.0, 1.0),
+    ("f1", "F1 (binary)", "radar_f1", 0.0, 1.0),
+    ("mcc", "MCC (binary)", "radar_mcc", -1.0, 1.0),
+    ("auprc", "AUPRC (binary)", "radar_auprc", 0.0, 1.0),
+    ("auc", "AUC (binary)", "radar_auc", 0.0, 1.0),
 ]
 
 # 3-class TripGRN / DeepFGRN radars.
@@ -195,7 +197,7 @@ def _plot_perclass_metric_radars(
 def _plot_radar_set(
     fold_df: pd.DataFrame,
     *,
-    specs: Sequence[Tuple[str, str, str]],
+    specs: Sequence[Tuple],
     methods: Sequence[str],
     method_colors: Dict[str, str],
     gse_ids: Sequence[str],
@@ -204,7 +206,12 @@ def _plot_radar_set(
     combined_csv_name: str,
 ) -> None:
     mean_rows: List[dict] = []
-    for metric_key, metric_label, stem in specs:
+    for spec in specs:
+        if len(spec) == 5:
+            metric_key, metric_label, stem, ymin, ymax = spec
+        else:
+            metric_key, metric_label, stem = spec  # type: ignore[misc]
+            ymin, ymax = 0.0, 1.0
         if metric_key not in fold_df.columns:
             print(f"[skip] missing column {metric_key}")
             continue
@@ -231,8 +238,9 @@ def _plot_radar_set(
             method_colors=method_colors,
             out_path=out_pdf,
             network_label=network_label,
-            ymin=0.0,
-            ymax=1.0,
+            ymin=float(ymin),
+            ymax=float(ymax),
+            title="",
         )
         print(f"[radar] {out_pdf.name}")
 

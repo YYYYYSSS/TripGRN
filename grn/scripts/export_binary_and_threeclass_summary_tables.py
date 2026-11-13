@@ -187,7 +187,8 @@ def build_binary_fold(summary: Path) -> pd.DataFrame:
             )
 
     out = pd.DataFrame(rows)
-    # Fill Trip/Deep AUPRC (and optionally overwrite AUC) from strict-binary cache.
+    # Binary AUC stays train-time NoReg OvR (never overwritten).
+    # Binary AUPRC filled from protocol-aligned ranking cache when cache AUC matches NoReg OvR.
     cache = summary / "trip_deep_strict_binary_ranking_cache.csv"
     if cache.is_file() and not out.empty:
         c = pd.read_csv(cache)
@@ -196,16 +197,40 @@ def build_binary_fold(summary: Path) -> pd.DataFrame:
             c["fold"] = c["fold"].astype(int)
             key = ["method", "gse_id", "fold"]
             out = out.merge(
-                c[key + ["auc", "auprc"]].rename(columns={"auc": "auc_cache", "auprc": "auprc_cache"}),
+                c[key + ["auc", "auprc"]].rename(
+                    columns={"auc": "auc_cache", "auprc": "auprc_cache"}
+                ),
                 on=key,
                 how="left",
             )
-            # Prefer cache AUPRC always; keep stored NoReg OvR as AUC unless cache AUC present.
-            m = out["auprc_cache"].notna()
-            out.loc[m, "auprc"] = out.loc[m, "auprc_cache"]
-            m2 = out["auc_cache"].notna()
-            out.loc[m2, "auc"] = out.loc[m2, "auc_cache"]
+            # Accept AUPRC only when cache ROC matches stored NoReg OvR.
+            # Tol 0.05: Windows TF reload of DoRothEA ckpts can drift ~0.02–0.04 vs
+            # train-time NoReg OvR; wrong-GRN mistakes are ~0.20+ and still rejected.
+            ok = (
+                out["auprc_cache"].notna()
+                & out["auc_cache"].notna()
+                & out["auc"].notna()
+                & ((out["auc_cache"] - out["auc"]).abs() <= 0.05)
+            )
+            n_ok = int(ok.sum())
+            n_rej = int((out["auprc_cache"].notna() & ~ok).sum())
+            out.loc[ok, "auprc"] = out.loc[ok, "auprc_cache"]
             out = out.drop(columns=["auc_cache", "auprc_cache"])
+            print(
+                f"[export] binary AUPRC from cache: filled={n_ok}, "
+                f"rejected_auc_mismatch={n_rej} (AUC kept as NoReg OvR)"
+            )
+    else:
+        n_td = (
+            int(((out["method"] == "TripGRN") | (out["method"] == "DeepFGRN")).sum())
+            if not out.empty
+            else 0
+        )
+        if n_td:
+            print(
+                f"[export] Trip/Deep binary AUPRC left NaN ({n_td} rows); "
+                f"missing {cache.name}"
+            )
 
     out["method"] = pd.Categorical(out["method"], categories=list(METHODS_BIN), ordered=True)
     gse_order = [g for g in PANCANCER_GSE_IDS if g in set(out["gse_id"])]

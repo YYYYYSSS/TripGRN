@@ -43,8 +43,9 @@ def calculate_metrics(y_true, y_pred, y_prob):
             auprc = float("nan")
         metrics["auprc"].append(auprc)
 
-    # 3. 宏平均AUC
-    metrics["macro_auc"] = np.nanmean(metrics["auc_ovr"])
+    # 3. 宏平均 AUC / AUPRC
+    metrics["macro_auc"] = float(np.nanmean(metrics["auc_ovr"]))
+    metrics["auprc_macro"] = float(np.nanmean(metrics["auprc"]))
 
     # 4. 每类OvO AUC（类别i vs 其他每个类别j的AUC平均）
     metrics["auc_ovo_per_class"] = []
